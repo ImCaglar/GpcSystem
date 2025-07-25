@@ -13,8 +13,8 @@
     "autoprefixer": "^10.4.21",
     "next": "15.0.0",
     "node-cron": "^4.2.1",
-    "pdf-extraction": "^1.0.2",
     "pdf-lib": "^1.17.1",
+    "pdf2json": "^3.1.6",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
     "xlsx": "^0.18.5"

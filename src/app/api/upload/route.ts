@@ -127,42 +127,367 @@ function extractInvoiceDate(text) {
   return new Date().toISOString().split('T')[0]
 }
 
-// IMPROVED: Simplified Context7 PDF parsing for Gloria invoices
+// Extract text from pdf2json structured data
+function extractTextFromPdf2Json(jsonData) {
+  console.log('🔧 Extracting text from pdf2json structured data...')
+  
+  if (!jsonData?.Pages || !Array.isArray(jsonData.Pages)) {
+    console.log('❌ No pages found in pdf2json data')
+    return ''
+  }
+  
+  let fullText = ''
+  
+  // Process each page
+  for (let pageIndex = 0; pageIndex < jsonData.Pages.length; pageIndex++) {
+    const page = jsonData.Pages[pageIndex]
+    console.log(`📄 Processing page ${pageIndex + 1}/${jsonData.Pages.length}`)
+    
+    if (!page.Texts || !Array.isArray(page.Texts)) {
+      console.log(`⚠️ No texts found on page ${pageIndex + 1}`)
+      continue
+    }
+    
+    // Collect all text elements with positioning
+    const textElements = []
+    
+    for (const textObj of page.Texts) {
+      if (textObj.R && Array.isArray(textObj.R)) {
+        for (const run of textObj.R) {
+          if (run.T) {
+            const decodedText = decodeURIComponent(run.T)
+            textElements.push({
+              text: decodedText,
+              x: textObj.x || 0,
+              y: textObj.y || 0,
+              width: textObj.w || 0
+            })
+          }
+        }
+      }
+    }
+    
+    // Sort by Y position (top to bottom), then X position (left to right)
+    textElements.sort((a, b) => {
+      const yDiff = a.y - b.y
+      if (Math.abs(yDiff) < 0.5) { // Same line (within 0.5 units) - conservative
+        return a.x - b.x // Sort by X position
+      }
+      return yDiff
+    })
+    
+    // CONSERVATIVE SPACING: Simple text combination with minimal spacing logic
+    let currentLine = ''
+    let lastY = -1
+    
+    for (const element of textElements) {
+      // New line if Y position changed significantly
+      if (lastY !== -1 && Math.abs(element.y - lastY) > 0.5) {
+        if (currentLine.trim()) {
+          fullText += currentLine.trim() + '\n'
+        }
+        currentLine = ''
+      }
+      
+      // Simple spacing - always add one space between elements
+      if (currentLine.length > 0) {
+        currentLine += ' '
+      }
+      currentLine += element.text
+      lastY = element.y
+    }
+    
+    // Add final line
+    if (currentLine.trim()) {
+      fullText += currentLine.trim() + '\n'
+    }
+    
+    console.log(`✅ Page ${pageIndex + 1}: ${textElements.length} text elements processed`)
+    
+    // Debug: Show first few text elements
+    if (pageIndex === 0 && textElements.length > 0) {
+      console.log(`🔍 First 5 text elements:`)
+      for (let i = 0; i < Math.min(5, textElements.length); i++) {
+        const element = textElements[i]
+        console.log(`   ${i+1}: "${element.text}" (X: ${element.x.toFixed(2)}, Y: ${element.y.toFixed(2)})`)
+      }
+    }
+  }
+  
+  console.log(`📊 pdf2json extraction: ${fullText.length} characters, ${fullText.split('\n').length} lines`)
+  return fullText
+}
+
+// MULTI-PATTERN: PDF parsing with priorities (Gloria → Dotted → Plain Numbers)
 function parseInvoiceFromPDF(text) {
-  console.log(`🧮 Starting SIMPLIFIED Context7 parsing...`)
+  console.log(`🧮 Starting MULTI-PATTERN parsing (Gloria → Dotted → Plain Numbers)...`)
   
   const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0)
   const products = []
   
-  // Look for product lines with Gloria pattern: 153.01.XXXX
+  // 🔍 DEBUG: Track parsing statistics
+  let totalProductLines = 0
+  let skippedLines = 0
+  let failedParseLines = 0
+  let differentPatternLines = 0
+  let multilineProducts = 0
+  
+  console.log(`📄 Total lines to scan: ${lines.length}`)
+  
+  // PHASE 1: Extract product codes with PRIORITY system (Gloria first, others as fallback)
+  const productCodePositions = []
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     
-    // Skip if line doesn't contain product code
-    if (!line.match(/153\.01\.\d{4}/)) continue
+    // PRIORITY 1: Gloria standard pattern (153.01.XXXX)
+    const gloriaPattern = /(153\.01\.\d{4})/g
+    const gloriaMatches = [...line.matchAll(gloriaPattern)]
     
-    console.log(`🎯 PROCESSING LINE: "${line}"`)
+    if (gloriaMatches.length > 0) {
+      // Found Gloria codes - use them
+      for (const match of gloriaMatches) {
+        productCodePositions.push({
+          lineIndex: i,
+          code: match[1],
+          line: line,
+          startPos: match.index,
+          pattern: 'Gloria Primary'
+        })
+      }
+    } else {
+      // PRIORITY 2: Alternative patterns (controlled fallback)
+      const alternativePatterns = [
+        { regex: /(153\.01\.\d{3,5})/g, name: 'Gloria Extended' },    // 153.01.XXX or 153.01.XXXXX
+        { regex: /(\d{3}\.\d{2}\.\d{3,4})/g, name: 'Dotted 3-2-3' }, // XXX.XX.XXX
+        { regex: /(\d{2,3}\.\d{1,2}\.\d{3,4})/g, name: 'Dotted Flexible' }, // XX.X.XXX
+      ]
       
-    const product = parseGloriaProductLine(line)
-      if (product) {
-        products.push(product)
-      console.log(`✅ PARSED: ${product.productCode} | ${product.productName} | ${product.quantity}${product.unit} | ₺${product.unitPrice} | Total: ₺${product.total}`)
+      let foundAlternative = false
+      for (const {regex, name} of alternativePatterns) {
+        const altMatches = [...line.matchAll(regex)]
+        
+        for (const match of altMatches) {
+          const code = match[1]
+          
+          // SAFETY: Skip obvious non-product codes
+          const isInvoiceNumber = /^(SEN|TIC|FAT|FTR|INV)\d+/i.test(code) || code.length > 12
+          const isDate = /^\d{2}[.\/\-]\d{2}[.\/\-]\d{2,4}$/.test(code)
+          const isPureNumber = /^\d{6,}$/.test(code) && code.length > 8 // Very long numbers
+          
+          if (!isInvoiceNumber && !isDate && !isPureNumber) {
+            productCodePositions.push({
+              lineIndex: i,
+              code: code,
+              line: line,
+              startPos: match.index,
+              pattern: name
+            })
+            foundAlternative = true
+            break // Only take first alternative match per line
+          }
+        }
+        if (foundAlternative) break
+      }
+      
+      // PRIORITY 3: Plain numbers (very controlled - only as last resort)
+      if (!foundAlternative) {
+        const plainNumberMatches = [...line.matchAll(/\b(\d{2,4})\b/g)]
+        
+        for (const match of plainNumberMatches) {
+          const code = match[1]
+          const startPos = match.index
+          
+          // VERY STRICT SAFETY for plain numbers
+          const contextBefore = line.substring(Math.max(0, startPos - 10), startPos).toLowerCase()
+          const contextAfter = line.substring(startPos + code.length, startPos + code.length + 10).toLowerCase()
+          
+          // Skip if it's obviously quantity, price, or date
+          const isQuantity = /\b(kg|adet|lt|gram|pc|litre)\b/i.test(contextAfter)
+          const isPrice = /\b(tl|₺|lira)\b/i.test(contextAfter) || /fiyat|tutar|toplam/i.test(contextBefore)
+          const isDate = /tarih|date/i.test(contextBefore) || /\d{2}[.\/\-]\d{2}[.\/\-]/.test(line)
+          const isYear = parseInt(code) > 2020 && parseInt(code) < 2030 // Years 2021-2029
+          const isTooSmall = parseInt(code) < 10 // Very small numbers
+          const isLineNumber = /^\s*\d+\s+/.test(line) && startPos < 5 // Line number at start
+          
+          // Only accept if it looks like a product code context
+          const hasProductContext = /domates|biber|salata|ispanak|kabak|lahana|karnabahar|patates|mantar|turp|brokoli|marul|aysberg|endivyen/i.test(line)
+          const isAtLineStart = startPos < 20 && !/^\s*\d+\s+/.test(line) // Near start but not line number
+          
+          if (!isQuantity && !isPrice && !isDate && !isYear && !isTooSmall && !isLineNumber && (hasProductContext || isAtLineStart)) {
+            productCodePositions.push({
+              lineIndex: i,
+              code: code,
+              line: line,
+              startPos: startPos,
+              pattern: 'Plain Number'
+            })
+            break // Only take first plain number per line
+          }
+        }
+      }
     }
   }
   
-  console.log(`📊 Simplified parsing completed: ${products.length} products found`)
+  console.log(`🔍 Found ${productCodePositions.length} product codes in PDF`)
+  
+  // PHASE 2: For each product code, try to build complete product info
+  for (let codeIndex = 0; codeIndex < productCodePositions.length; codeIndex++) {
+    const codeInfo = productCodePositions[codeIndex]
+    const currentLineIndex = codeInfo.lineIndex
+    
+    console.log(`🎯 PROCESSING CODE ${codeIndex + 1}/${productCodePositions.length}: ${codeInfo.code} at line ${currentLineIndex + 1}`)
+    
+    // Try single line first
+    let productLine = lines[currentLineIndex]
+    let product = parseGloriaProductLine(productLine)
+    
+    if (!product && currentLineIndex + 1 < lines.length) {
+      // Try multi-line: combine current line + next line
+      const nextLine = lines[currentLineIndex + 1]
+      const combinedLine = productLine + ' ' + nextLine
+      console.log(`🔄 Trying multi-line: "${combinedLine}"`)
+      product = parseGloriaProductLine(combinedLine)
+      if (product) {
+        multilineProducts++
+        console.log(`✅ MULTI-LINE SUCCESS: ${product.productCode}`)
+      }
+    }
+    
+    if (!product && currentLineIndex + 2 < lines.length) {
+      // Try 3-line combination
+      const nextLine1 = lines[currentLineIndex + 1] || ''
+      const nextLine2 = lines[currentLineIndex + 2] || ''
+      const combinedLine = productLine + ' ' + nextLine1 + ' ' + nextLine2
+      console.log(`🔄 Trying 3-line combo: "${combinedLine}"`)
+      product = parseGloriaProductLine(combinedLine)
+      if (product) {
+        multilineProducts++
+        console.log(`✅ 3-LINE SUCCESS: ${product.productCode}`)
+      }
+    }
+    
+    if (product) {
+      products.push(product)
+      totalProductLines++
+      console.log(`✅ PARSED: ${product.productCode} | ${product.productName} | ${product.quantity}${product.unit} | ₺${product.unitPrice} | Total: ₺${product.total}`)
+    } else {
+      failedParseLines++
+      console.log(`❌ FAILED TO PARSE: "${codeInfo.line}"`)
+    }
+  }
+  
+  
+  console.log(`📊 MULTI-PATTERN PARSING SUMMARY:`)
+  console.log(`   📄 Total Lines in PDF: ${lines.length}`)
+  console.log(`   🔍 Product Codes Found: ${productCodePositions.length}`)
+  
+  // Show pattern distribution
+  const patternStats = {}
+  productCodePositions.forEach(pos => {
+    const pattern = pos.pattern || 'unknown'
+    patternStats[pattern] = (patternStats[pattern] || 0) + 1
+  })
+  console.log(`   📈 Code Pattern Distribution:`)
+  Object.entries(patternStats).forEach(([pattern, count]) => {
+    console.log(`      • ${pattern}: ${count} codes`)
+  })
+  
+  console.log(`   ✅ Successfully Parsed: ${products.length}`)
+  console.log(`   ❌ Failed to Parse: ${failedParseLines}`)
+  console.log(`   🔄 Multi-line Products: ${multilineProducts}`)
+  console.log(`   📊 Success Rate: ${productCodePositions.length > 0 ? Math.round((products.length/productCodePositions.length)*100) : 0}%`)
+  
+  if (products.length !== productCodePositions.length) {
+    console.log(`⚠️ MISMATCH: Expected ${productCodePositions.length} products but parsed ${products.length}`)
+    console.log(`💡 This suggests some products are split across multiple lines or have parsing issues`)
+  }
+  
   return products
 }
+
+
 
 // ENHANCED: Parse single Gloria product line for Turkish e-invoice format
 function parseGloriaProductLine(line) {
   try {
-    // Extract product code first (153.01.XXXX)
-    const codeMatch = line.match(/(153\.01\.\d{4})/)
-    if (!codeMatch) return null
+        // PRIORITY CODE EXTRACTION - Gloria first, alternatives as fallback
+    let productCode = null
+    let codeType = 'none'
     
-    const productCode = codeMatch[1]
-    console.log(`📦 Code: ${productCode}`)
+    // PRIORITY 1: Gloria standard (153.01.XXXX)
+    const gloriaPattern = /(153\.01\.\d{4})/
+    let match = line.match(gloriaPattern)
+    if (match) {
+      productCode = match[1]
+      codeType = 'Gloria Primary'
+    } else {
+      // PRIORITY 2: Alternative patterns
+      const alternativePatterns = [
+        { regex: /(153\.01\.\d{3,5})/, name: 'Gloria Extended' },
+        { regex: /(\d{3}\.\d{2}\.\d{3,4})/, name: 'Dotted 3-2-3' },
+        { regex: /(\d{2,3}\.\d{1,2}\.\d{3,4})/, name: 'Dotted Flexible' },
+      ]
+      
+      for (const {regex, name} of alternativePatterns) {
+        match = line.match(regex)
+        if (match) {
+          const code = match[1]
+          
+          // SAFETY: Skip obvious non-product codes
+          const isInvoiceNumber = /^(SEN|TIC|FAT|FTR|INV)\d+/i.test(code) || code.length > 12
+          const isDate = /^\d{2}[.\/\-]\d{2}[.\/\-]\d{2,4}$/.test(code)
+          const isPureNumber = /^\d{6,}$/.test(code) && code.length > 8
+          
+          if (!isInvoiceNumber && !isDate && !isPureNumber) {
+            productCode = code
+            codeType = name
+            break
+          }
+        }
+      }
+      
+      // PRIORITY 3: Plain numbers (if no alternatives found)
+      if (!productCode) {
+        const plainNumberMatches = [...line.matchAll(/\b(\d{2,4})\b/g)]
+        
+        for (const match of plainNumberMatches) {
+          const code = match[1]
+          const startPos = match.index
+          
+          // VERY STRICT SAFETY for plain numbers
+          const contextBefore = line.substring(Math.max(0, startPos - 10), startPos).toLowerCase()
+          const contextAfter = line.substring(startPos + code.length, startPos + code.length + 10).toLowerCase()
+          
+          // Skip if it's obviously quantity, price, or date
+          const isQuantity = /\b(kg|adet|lt|gram|pc|litre)\b/i.test(contextAfter)
+          const isPrice = /\b(tl|₺|lira)\b/i.test(contextAfter) || /fiyat|tutar|toplam/i.test(contextBefore)
+          const isDate = /tarih|date/i.test(contextBefore) || /\d{2}[.\/\-]\d{2}[.\/\-]/.test(line)
+          const isYear = parseInt(code) > 2020 && parseInt(code) < 2030
+          const isTooSmall = parseInt(code) < 10
+          const isLineNumber = /^\s*\d+\s+/.test(line) && startPos < 5
+          
+          // Only accept if it looks like a product code context
+          const hasProductContext = /domates|biber|salata|ispanak|kabak|lahana|karnabahar|patates|mantar|turp|brokoli|marul|aysberg|endivyen/i.test(line)
+          const isAtLineStart = startPos < 20 && !/^\s*\d+\s+/.test(line)
+          
+          if (!isQuantity && !isPrice && !isDate && !isYear && !isTooSmall && !isLineNumber && (hasProductContext || isAtLineStart)) {
+            productCode = code
+            codeType = 'Plain Number'
+            break
+          }
+        }
+      }
+    }
+    
+    if (productCode) {
+      console.log(`📦 Code found: ${productCode} (Type: ${codeType})`)
+    }
+    
+    // If no code found, this shouldn't be a product line
+    if (!productCode) {
+      console.log(`❌ No product code found in line: "${line}"`)
+      return null
+    }
     
     // Remove leading row number if exists (1, 2, 3, etc.)
     let cleanLine = line.replace(/^\s*\d+\s+/, '').trim()
@@ -245,8 +570,13 @@ function parseGloriaProductLine(line) {
       })
     }
     
-    // Remove tax rates, percentages, and common e-invoice elements
+    // Remove tax rates, percentages, brand info in parentheses, and common e-invoice elements
     cleanLine = cleanLine
+      .replace(/\s*\([^)]*ERUST[^)]*\)/gi, '')      // Remove (ERUST&GREENADA), (ERUST)
+      .replace(/\s*\([^)]*GREENADA[^)]*\)/gi, '')   // Remove any GREENADA variants
+      .replace(/\s*\([^)]*GREENATE[^)]*\)/gi, '')   // Remove (ERUST&GREENATE)
+      .replace(/\s*\([^)]*LIKKO[^)]*\)/gi, '')      // Remove (LIKKO ...)
+      .replace(/\s*\([A-Z&\s]{3,}\)/gi, '')         // Remove any uppercase brand info in parentheses
       .replace(/\s*%\s*\d+[,.]?\d*\s*/g, '')        // Tax percentages
       .replace(/\s*KDV\s*Oranı\s*/gi, '')           // KDV Oranı
       .replace(/\s*İskonto\s*/gi, '')               // İskonto
@@ -266,9 +596,13 @@ function parseGloriaProductLine(line) {
     
     console.log(`🏷️ Extracted: "${productName}" | ${quantity}${unit} | ₺${unitPrice} | ₺${total}`)
     
-    // Enhanced validation
-    if (!productName || productName.length < 2) {
-      console.log(`❌ Invalid product name: "${productName}"`)
+    // Enhanced validation - Reject unit-only names and very short names
+    const isUnitName = /^(KG|ADET|LT|GRAM|LITRE|PC|Adet|Kg|Lt|GRAM|GR)$/i.test(productName.trim())
+    const isTooShort = productName.length < 3
+    const isInvalidName = /^[\s\-\|\,\.]+$/.test(productName) // Just symbols
+    
+    if (!productName || isTooShort || isUnitName || isInvalidName) {
+      console.log(`❌ Invalid product name: "${productName}" (Unit: ${isUnitName}, Short: ${isTooShort}, Invalid: ${isInvalidName})`)
       return null
     }
     
@@ -314,7 +648,7 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
-  console.log('🚀 PDF Upload API Started - Memory-Only Processing with pdf-extraction')
+  console.log('🚀 PDF Upload API Started - Multi-Pattern Processing (Gloria→Dotted→Numbers)')
 
   try {
     const formData = await request.formData()
@@ -335,35 +669,72 @@ export async function POST(request: NextRequest) {
     const buffer = Buffer.from(arrayBuffer)
     console.log(`🧠 PDF loaded in memory: ${buffer.length} bytes - No disk save`)
 
-    // Parse PDF with pdf-extraction (clean library without test dependencies)
-    console.log('📖 Parsing PDF with pdf-extraction...')
+    // Parse PDF with pdf2json (structured JSON with positioning)
+    console.log('📖 Parsing PDF with pdf2json...')
 
     let extractedText = ''
     let pdfData = null
+    let jsonData = null
     try {
-      const pdfExtraction = (await import('pdf-extraction')).default
-      pdfData = await pdfExtraction(buffer)
-      extractedText = pdfData.text || ''
+      const PDFParser = (await import('pdf2json')).default
+      const pdfParser = new PDFParser()
       
-      console.log(`✅ PDF parsed successfully: ${pdfData.pages} pages, ${extractedText.length} chars`)
+      // Parse PDF to structured JSON
+      await new Promise((resolve, reject) => {
+        pdfParser.on('pdfParser_dataError', reject)
+        pdfParser.on('pdfParser_dataReady', (data) => {
+          jsonData = data
+          resolve(data)
+        })
+        pdfParser.parseBuffer(buffer)
+      })
+      
+      // Extract text from JSON structure with positioning
+      extractedText = extractTextFromPdf2Json(jsonData)
+      pdfData = { pages: jsonData.Pages?.length || 0, text: extractedText }
+      
+      console.log(`✅ PDF parsed successfully with pdf2json: ${jsonData.Pages?.length || 0} pages, ${extractedText.length} chars`)
       console.log(`📄 PDF Metadata:`, {
-        pages: pdfData.pages,
+        pages: jsonData.Pages?.length || 0,
         textLength: extractedText.length,
         hasText: extractedText.length > 0,
         firstChars: extractedText.substring(0, 100),
-        info: pdfData.info || 'No info'
+        library: 'pdf2json',
+        hasStructuredData: !!jsonData.Pages
       })
       
       // Additional debug for empty text
       if (extractedText.length === 0 || extractedText.trim().length < 10) {
         console.log('⚠️ PDF text extraction returned minimal content')
-        console.log('🔍 Raw extraction result:', JSON.stringify(pdfData, null, 2))
+        console.log('🔍 Raw JSON structure:')
+        if (jsonData?.Pages) {
+          console.log(`   📄 Pages: ${jsonData.Pages.length}`)
+          jsonData.Pages.slice(0, 1).forEach((page, i) => {
+            console.log(`   📝 Page ${i+1}: ${page.Texts?.length || 0} text objects`)
+          })
+        }
         
-        // Try alternative extraction if available
-        if (pdfData.lines && Array.isArray(pdfData.lines)) {
-          console.log('🔄 Trying alternative extraction from lines...')
-          extractedText = pdfData.lines.join('\n')
-          console.log(`📝 Alternative extraction: ${extractedText.length} chars`)
+        // Try raw text extraction from JSON if structured extraction failed
+        if (jsonData?.Pages && Array.isArray(jsonData.Pages)) {
+          console.log('🔄 Trying raw text extraction from JSON...')
+          let rawText = ''
+          for (const page of jsonData.Pages) {
+            if (page.Texts) {
+              for (const textObj of page.Texts) {
+                if (textObj.R) {
+                  for (const run of textObj.R) {
+                    if (run.T) {
+                      rawText += decodeURIComponent(run.T) + ' '
+                    }
+                  }
+                }
+              }
+            }
+          }
+          if (rawText.trim().length > extractedText.length) {
+            extractedText = rawText.trim()
+            console.log(`📝 Raw extraction: ${extractedText.length} chars`)
+          }
         }
       }
       
@@ -378,7 +749,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         error: 'PDF text extraction failed: ' + (extractionError as Error).message,
         details: {
-          library: 'pdf-extraction',
+          library: 'pdf2json',
           errorType: extractionError.name,
           suggestion: 'PDF may be password protected, corrupted, or image-based'
         }
@@ -402,8 +773,9 @@ export async function POST(request: NextRequest) {
           textSample: extractedText.substring(0, 800),
           pdfMetadata: pdfData ? {
             pages: pdfData.pages,
-            info: pdfData.info,
-            hasLines: pdfData.lines ? pdfData.lines.length : 0
+            library: 'pdf2json',
+            hasStructuredData: !!jsonData?.Pages,
+            totalTextObjects: jsonData?.Pages ? jsonData.Pages.reduce((total, page) => total + (page.Texts?.length || 0), 0) : 0
           } : null,
           searchedPatterns: [
             'Fatura No:', 'Invoice No:', 'Fatura Numarası:', 'Belge No:', 
